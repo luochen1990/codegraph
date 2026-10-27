@@ -360,3 +360,84 @@ describe('detectWorktreeIndexMismatch — nested repos covered by the parent ind
     }
   });
 });
+
+/**
+ * Fail-loud for live foreign paths named in the QUERY. The silent-wrong-content
+ * incident: an agent in a linked worktree OUTSIDE the main repo (the
+ * /tmp/<…>/<branch> layout) called codegraph_explore naming the worktree's
+ * absolute file path, without projectPath. The query-path suffix walk dropped
+ * the foreign prefix, pinned the indexed repo-relative file, and served the
+ * MAIN tree's branch of the code as the answer — bannerless, because the
+ * worktree notices key off the effective project root, which pointed at the
+ * indexed tree. These tests pin the refusal: a query naming a live foreign
+ * path must fail loudly with guidance, never serve plausible-but-wrong
+ * content.
+ */
+describe('foreign query paths fail loud', () => {
+  let mainRepo: string;     // main checkout — owns the .codegraph index
+  let tmpWorktree: string;  // linked worktree OUTSIDE the repo (SOP /tmp layout)
+  let cg: CodeGraph;
+  let handler: ToolHandler;
+
+  beforeEach(async () => {
+    mainRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-wt-foreign-'));
+
+    git(mainRepo, 'init', '-q');
+    git(mainRepo, 'config', 'user.email', 'test@example.com');
+    git(mainRepo, 'config', 'user.name', 'Test');
+    git(mainRepo, 'config', 'commit.gpgsign', 'false');
+    fs.mkdirSync(path.join(mainRepo, 'src'));
+    fs.writeFileSync(path.join(mainRepo, 'src', 'a.ts'), 'export function mainOnly() { return 1; }\n');
+    git(mainRepo, 'add', '.');
+    git(mainRepo, 'commit', '-q', '-m', 'init');
+
+    cg = CodeGraph.initSync(mainRepo);
+    await cg.indexAll();
+
+    // The incident layout: the worktree lives OUTSIDE the repo, on an
+    // unrelated path — no up-walk from it can reach the main index.
+    tmpWorktree = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-wt-foreign-wt-'));
+    fs.rmSync(tmpWorktree, { recursive: true, force: true });
+    git(mainRepo, 'worktree', 'add', '-q', '-b', 'feature', tmpWorktree);
+    // Diverge the worktree's copy so serving the main index is observably wrong.
+    fs.writeFileSync(
+      path.join(tmpWorktree, 'src', 'a.ts'),
+      'export function worktreeOnly() { return 2; }\n',
+    );
+    git(tmpWorktree, 'add', '.');
+    git(tmpWorktree, 'commit', '-q', '-m', 'diverge');
+
+    handler = new ToolHandler(cg);
+  });
+
+  afterEach(() => {
+    try { cg.destroy(); } catch { /* best effort */ }
+    try { git(mainRepo, 'worktree', 'remove', '--force', tmpWorktree); } catch { /* best effort */ }
+    fs.rmSync(mainRepo, { recursive: true, force: true });
+    try { fs.rmSync(tmpWorktree, { recursive: true, force: true }); } catch { /* best effort */ }
+  });
+
+  it('explore REFUSES a query naming a live foreign absolute path (incident shape)', async () => {
+    const res = await handler.execute('codegraph_explore', {
+      query: `what does ${path.join(tmpWorktree, 'src', 'a.ts')} export`,
+    });
+    const text = res.content[0].text;
+    // Loud refusal with the distinguishing facts, and never the wrong content.
+    expect(text).toContain('outside the indexed project root');
+    expect(text).toContain(tmpWorktree);
+    expect(text).toContain(mainRepo);
+    expect(text).not.toContain('mainOnly');
+  });
+
+  it('explore still answers the SAME file by repo-relative path (control)', async () => {
+    const res = await handler.execute('codegraph_explore', { query: 'what does src/a.ts export' });
+    expect(res.content[0].text).toContain('mainOnly');
+  });
+
+  it('explore answers an absolute path UNDER the indexed root (control)', async () => {
+    const res = await handler.execute('codegraph_explore', {
+      query: `what does ${path.join(mainRepo, 'src', 'a.ts')} export`,
+    });
+    expect(res.content[0].text).toContain('mainOnly');
+  });
+});

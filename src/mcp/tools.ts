@@ -4233,6 +4233,7 @@ export class ToolHandler {
     // `+page.svelte`), starving the very files the agent asked for.
     let pinnedFiles: string[] = [];
     let unresolvedPathSpans: string[] = [];
+    let foreignPathSpans: string[] = [];
     let lineAnchors: QueryLineAnchor[] = [];
     let setAsideMatches: QuerySetAsideMatch[] = [];
     let matchQuery = query;
@@ -4244,6 +4245,8 @@ export class ToolHandler {
           {
             maxPins: maxFiles,
             existsOnDisk: (rel) => pathIsProjectFile(projectRoot, rel),
+            projectRoot,
+            existsAbsOnDisk: (abs) => existsSync(abs),
             symbolFiles: (symbol) => filesDefiningSymbol(cg, symbol),
           },
         );
@@ -4254,7 +4257,34 @@ export class ToolHandler {
           setAsideMatches = extraction.setAsideMatches;
           matchQuery = normalizeQuerySpelling(extraction.strippedQuery);
         }
+        foreignPathSpans = extraction.foreignPathSpans;
       } catch { /* path pinning must never fail an explore call */ }
+    }
+    // A query naming a LIVE absolute path outside the indexed project — the
+    // git-worktree shape (a linked worktree of this repo at /tmp/… while the
+    // index serves the main checkout). The suffix walk in
+    // `extractQueryPaths` refused to pin it (`foreignPathSpans`), because
+    // pinning would serve the indexed tree's branch of the code as the answer
+    // to a worktree path: plausible, confidently wrong, and bannerless — the
+    // worktree notices key off the effective project root, which here points
+    // at the indexed tree, not the foreign one. Refuse the whole call and
+    // point at the right tools. Thrown past the extractor's own catch above,
+    // which exists to keep pinning failures NON-fatal — this is a verdict,
+    // not a failure.
+    if (foreignPathSpans.length > 0) {
+      throw new NotIndexedError(
+        `Refusing to answer: the query names path(s) outside the indexed project root.\n` +
+        `  Indexed project: ${projectRoot}\n` +
+        `  Foreign path(s): ${foreignPathSpans.join(', ')}\n` +
+        'A foreign path usually means a git worktree or a second checkout of the repo — ' +
+        'a DIFFERENT branch than this index covers. Answering from this index would look ' +
+        "right but reflect the indexed tree's code, not the path you asked about. Instead:\n" +
+        '  • For files under a foreign path, use your built-in Read/Grep/Glob for that tree ' +
+        'this session — codegraph has no index there (the user can run "codegraph init" in ' +
+        'it to enable one)\n' +
+        '  • If you actually meant the equivalent file in the indexed project, re-query with ' +
+        'its repo-relative path (e.g. "src/lib/foo.ts")'
+      );
     }
     // A COBOL copybook the query names (`CVACT01Y`) names its FILE as surely as
     // `app/cpy/CVACT01Y.cpy` would (#2342), so it is pinned the same way: the

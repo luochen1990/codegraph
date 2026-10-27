@@ -28,7 +28,12 @@
  * answer (is this dotless slashed span, `scripts/deploy`, a real file that is
  * merely unindexed, or is it prose like `and/or`?) is delegated to an OPTIONAL
  * `existsOnDisk` predicate the caller injects — the fs access stays at the call
- * site, which owns the project root, and this module stays pure.
+ * site, which owns the project root, and this module stays pure. The
+ * foreign-path question gets the same treatment: an ABSOLUTE span outside the
+ * `projectRoot` the caller serves that exists on disk (`existsAbsOnDisk`) and
+ * suffix-matches an indexed file is a LIVE foreign tree — most commonly a git
+ * worktree or second checkout of the repo — and is reported for refusal,
+ * never pinned (see `foreignPathSpans`).
  */
 
 export interface QueryPathExtraction {
@@ -43,6 +48,19 @@ export interface QueryPathExtraction {
    * surfaced to the agent so the miss is visible instead of silent.
    */
   unresolvedPathSpans: string[];
+  /**
+   * Absolute spans that suffix-match an indexed file while naming a path
+   * OUTSIDE the `projectRoot` the caller serves and existing on disk: a live
+   * foreign tree — most commonly a git worktree or a second checkout of the
+   * repo at another location. Never pinned: the suffix walk would drop the
+   * foreign prefix and pin the indexed repo-relative file, serving the indexed
+   * tree's branch of the code as the answer to a path in a DIFFERENT tree —
+   * plausible, confidently wrong, and bannerless (the worktree notices key
+   * off the effective project root, which points at the indexed tree, not the
+   * foreign one). Callers refuse the call. Empty unless both `projectRoot`
+   * and `existsAbsOnDisk` were given.
+   */
+  foreignPathSpans: string[];
   /**
    * Line spans the query anchored to a pinned file, 1-based and inclusive:
    * `compiler.py:776`, `foo.ts:12-40`, `foo.ts#L88-L120`, or prose next to a
@@ -257,6 +275,27 @@ function isClearlyPathShaped(normalized: string): boolean {
   return DOTTED_BASENAME.test(normalized.slice(slash + 1));
 }
 
+/** Filesystem-anchored, not repo-relative: POSIX `/…` or Windows `C:/…`
+ * (normalizeSpan has already flipped backslashes by this point). */
+function isAbsoluteSpan(normalized: string): boolean {
+  return normalized.startsWith('/') || /^[A-Za-z]:\//.test(normalized);
+}
+
+/**
+ * Lexically inside `projectRoot`, case-insensitive on the case-insensitive
+ * platforms. Pure string comparison: a symlinked SPELLING of an in-root path
+ * can read as foreign, which the caller's loud refusal surfaces (retry with
+ * the real spelling) instead of silently serving the wrong tree — the safe
+ * direction to err.
+ */
+function lexicallyInside(normalized: string, projectRoot: string): boolean {
+  const norm = (p: string): string =>
+    process.platform === 'darwin' || process.platform === 'win32' ? p.toLowerCase() : p;
+  const root = norm(projectRoot.replace(/[/\\]+$/, ''));
+  const span = norm(normalized);
+  return span === root || span.startsWith(root + '/');
+}
+
 /**
  * Resolve one normalized span against the indexed paths: exact match first,
  * then segment-aligned suffix matches, dropping leading segments one at a
@@ -306,6 +345,22 @@ export function extractQueryPaths(
      */
     existsOnDisk?: (relPath: string) => boolean;
     /**
+     * The project root the caller serves answers from (absolute). With
+     * `existsAbsOnDisk`, an ABSOLUTE span outside it that suffix-matches an
+     * indexed file while existing on disk is reported as a `foreignPathSpans`
+     * entry instead of being pinned. Lexical containment only — see that
+     * field for why a wrong spelling errs the safe way.
+     */
+    projectRoot?: string;
+    /**
+     * Does this absolute path exist on disk? Optional, injected by the caller
+     * for the same reason as `existsOnDisk` — this module stays pure.
+     * Consulted only for spans that are absolute, outside `projectRoot`, and
+     * already suffix-matched an indexed file, so ordinary queries never touch
+     * it. Must not throw — the caller absorbs fs errors and returns false.
+     */
+    existsAbsOnDisk?: (absPath: string) => boolean;
+    /**
      * Which indexed files define a symbol spelled like this query token
      * (`clampedInt`, `SQLCompiler.as_sql`)? Optional, injected by the caller
      * for the same reason as `existsOnDisk`: the answer lives in the index,
@@ -324,6 +379,7 @@ export function extractQueryPaths(
     strippedQuery: query,
     pinnedFiles: [],
     unresolvedPathSpans: [],
+    foreignPathSpans: [],
     lineAnchors: [],
     setAsideMatches: [],
   };
@@ -339,6 +395,7 @@ export function extractQueryPaths(
   const pinned: string[] = [];
   const pinnedSeen = new Set<string>();
   const unresolved: string[] = [];
+  const foreign: string[] = [];
   const anchors: QueryLineAnchor[] = [];
   const setAside: QuerySetAsideMatch[] = [];
   /** Token index → the ONE file it pinned, for binding prose line ranges. */
@@ -407,6 +464,27 @@ export function extractQueryPaths(
     candidatesExamined++;
 
     const resolved = resolveSpan(normalized.toLowerCase(), lowerToOriginal, collectLimit);
+    // A LIVE foreign absolute path that the suffix walk just matched:
+    // anchored outside the project root the caller serves, yet real on disk —
+    // a git worktree or a second checkout of the repo at another location.
+    // Pinning the matched indexed file here would answer with the indexed
+    // tree's branch of the code, so record the span for the caller to refuse
+    // on instead. A foreign path that does NOT exist (pasted from another
+    // machine or doc) keeps the historical suffix fallback below: the local
+    // equivalent is the best available answer and no live tree can disagree
+    // with it. So does a foreign path that matches NOTHING — no pin, no
+    // wrong-content risk, nothing to refuse.
+    if (
+      resolved.matches.length > 0
+      && opts.projectRoot
+      && isAbsoluteSpan(normalized)
+      && !lexicallyInside(normalized, opts.projectRoot)
+      && opts.existsAbsOnDisk?.(normalized) === true
+    ) {
+      consumed.add(i);
+      if (foreign.length < 4) foreign.push(normalized);
+      continue;
+    }
     const pinnable = resolved.matches.length > 0 ? pinnableMatches(normalized, resolved.matches) : null;
     const matches = pinnable ?? [];
     const ambiguous = resolved.ambiguous || (resolved.matches.length > 0 && pinnable === null);
@@ -525,6 +603,7 @@ export function extractQueryPaths(
     strippedQuery: tokens.filter((_, i) => !consumed.has(i)).join(' '),
     pinnedFiles: pinned,
     unresolvedPathSpans: unresolved,
+    foreignPathSpans: foreign,
     lineAnchors: anchors.filter((a) => {
       const key = `${a.file}:${a.start}-${a.end}`;
       if (seenAnchor.has(key)) return false;

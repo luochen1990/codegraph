@@ -12,6 +12,9 @@
  */
 import { describe, it, expect } from 'vitest';
 import { extractQueryPaths, queryMightContainPaths } from '../src/search/query-paths';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 
 const INDEX = [
   'src/routes/m/projects/[id]/runs/[runId]/+page.svelte',
@@ -151,7 +154,7 @@ describe('extractQueryPaths — resolution and stripping', () => {
   it('passes through untouched when nothing resolves', () => {
     const q = 'plain prose question about scrolling';
     const out = extractQueryPaths(q, INDEX);
-    expect(out).toEqual({ strippedQuery: q, pinnedFiles: [], unresolvedPathSpans: [], lineAnchors: [], setAsideMatches: [] });
+    expect(out).toEqual({ strippedQuery: q, pinnedFiles: [], unresolvedPathSpans: [], foreignPathSpans: [], lineAnchors: [], setAsideMatches: [] });
   });
 });
 
@@ -191,13 +194,13 @@ describe('extractQueryPaths — extension-less kebab basenames', () => {
   it('leaves kebab prose that names no indexed file untouched — and unreported', () => {
     const q = 'how does cross-call dedup make explore non-blocking';
     const out = extractQueryPaths(q, INDEX);
-    expect(out).toEqual({ strippedQuery: q, pinnedFiles: [], unresolvedPathSpans: [], lineAnchors: [], setAsideMatches: [] });
+    expect(out).toEqual({ strippedQuery: q, pinnedFiles: [], unresolvedPathSpans: [], foreignPathSpans: [], lineAnchors: [], setAsideMatches: [] });
   });
 
   it('leaves a stem shared by too many files alone — one hot name must not pin half the repo', () => {
     const q = 'refactor the user-profile rendering';
     const out = extractQueryPaths(q, INDEX);
-    expect(out).toEqual({ strippedQuery: q, pinnedFiles: [], unresolvedPathSpans: [], lineAnchors: [], setAsideMatches: [] });
+    expect(out).toEqual({ strippedQuery: q, pinnedFiles: [], unresolvedPathSpans: [], foreignPathSpans: [], lineAnchors: [], setAsideMatches: [] });
   });
 
   it('pins all files sharing a stem when within the ambiguity budget', () => {
@@ -500,5 +503,93 @@ describe('extractQueryPaths — same-named files, narrowed by named symbols', ()
     const out = extractQueryPaths('chat-manager.ts ChatManager', SHARED, { symbolFiles: l.symbolFiles });
     expect(out.pinnedFiles).toEqual(['src/lib/chat-manager.ts']);
     expect(l.asked).toEqual([]);
+  });
+});
+
+describe('extractQueryPaths — foreign live absolute paths', () => {
+  // The incident shape: an agent working in a linked worktree (e.g.
+  // /tmp/<…>/<branch>) queries by absolute path while the index serves the
+  // main checkout. The suffix walk used to pin the indexed repo-relative file
+  // and silently serve the main tree's branch of the code.
+  const ROOT = '/home/dev/ws/beads-live-dashboard';
+
+  /** A real on-disk foreign tree (existsSync must see it). */
+  let foreignTree: string;
+
+  const OPTS = {
+    projectRoot: ROOT,
+    existsAbsOnDisk: (abs: string) => fs.existsSync(abs),
+  };
+
+  beforeEach(() => {
+    foreignTree = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-foreign-wt-'));
+    fs.mkdirSync(path.join(foreignTree, 'src', 'lib'), { recursive: true });
+    fs.writeFileSync(path.join(foreignTree, 'src', 'lib', 'chat-manager.ts'), '// worktree\n');
+  });
+
+  afterEach(() => {
+    fs.rmSync(foreignTree, { recursive: true, force: true });
+  });
+
+  it('does NOT pin a live foreign absolute path — reported for refusal', () => {
+    const span = `${foreignTree}/src/lib/chat-manager.ts`;
+    const out = extractQueryPaths(`review ${span} auth flow`, INDEX, OPTS);
+    expect(out.pinnedFiles).toEqual([]);
+    expect(out.foreignPathSpans).toEqual([span]);
+    expect(out.strippedQuery).toBe('review auth flow');
+  });
+
+  it('keeps the suffix fallback for a foreign path that does NOT exist (pasted from elsewhere)', () => {
+    // /Users/colby/… doesn't exist on this machine — the historical
+    // port-from-another-machine shape still resolves to the local file.
+    const out = extractQueryPaths(
+      'fix /Users/colby/dev/beads-live-dashboard/src/lib/chat-manager.ts', INDEX, OPTS,
+    );
+    expect(out.pinnedFiles).toEqual(['src/lib/chat-manager.ts']);
+    expect(out.foreignPathSpans).toEqual([]);
+  });
+
+  it('pins an absolute path that lives UNDER projectRoot (ordinary suffix walk)', () => {
+    const out = extractQueryPaths(
+      `fix ${ROOT}/src/lib/chat-manager.ts`, INDEX, OPTS,
+    );
+    expect(out.pinnedFiles).toEqual(['src/lib/chat-manager.ts']);
+    expect(out.foreignPathSpans).toEqual([]);
+  });
+
+  it('no projectRoot given — a live foreign path still suffix-resolves (back-compat)', () => {
+    const span = `${foreignTree}/src/lib/chat-manager.ts`;
+    const out = extractQueryPaths(`review ${span}`, INDEX);
+    expect(out.pinnedFiles).toEqual(['src/lib/chat-manager.ts']);
+    expect(out.foreignPathSpans).toEqual([]);
+  });
+
+  it('a live foreign path that matches NOTHING indexed stays untouched — nothing to refuse', () => {
+    // The span exists in the foreign tree but names no indexed file: no pin
+    // is possible, so no wrong content could be served, and the query keeps
+    // today's behavior (unresolved, reported).
+    fs.mkdirSync(path.join(foreignTree, 'docs'), { recursive: true });
+    fs.writeFileSync(path.join(foreignTree, 'docs', 'notes.md'), '// doc\n');
+    const span = `${foreignTree}/docs/notes.md`;
+    const out = extractQueryPaths(`summarize ${span} please`, INDEX, OPTS);
+    expect(out.pinnedFiles).toEqual([]);
+    expect(out.foreignPathSpans).toEqual([]);
+    expect(out.unresolvedPathSpans).toEqual([span]);
+    expect(out.strippedQuery).toBe('summarize please');
+  });
+
+  it('a bare existing absolute path that matches nothing stays in the query', () => {
+    // /tmp exists on every POSIX machine and lives outside ROOT — but it
+    // names no indexed file, so refusing here would reject ordinary prose
+    // like "how does the build use /tmp for caches".
+    const out = extractQueryPaths('how does the build use /tmp for caches', INDEX, OPTS);
+    expect(out).toEqual({
+      strippedQuery: 'how does the build use /tmp for caches',
+      pinnedFiles: [],
+      unresolvedPathSpans: [],
+      foreignPathSpans: [],
+      lineAnchors: [],
+      setAsideMatches: [],
+    });
   });
 });
